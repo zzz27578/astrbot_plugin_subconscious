@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example
+*.log
+config.json
+*_config.json
+data/
+.venv/
+.idea/
+.vscode/

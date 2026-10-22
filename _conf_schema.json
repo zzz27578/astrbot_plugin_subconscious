@@ -1,0 +1,52 @@
+{
+  "target_user_id": {
+    "description": "主动交互的目标用户 ID（必填；留空时不启动主动消息功能）",
+    "type": "string",
+    "default": ""
+  },
+  "target_platform": {
+    "description": "目标平台实例标识（可留空；收到目标用户私聊后自动识别，也会探测可用平台）",
+    "type": "string",
+    "default": ""
+  },
+  "tick_interval_minutes": {
+    "description": "潜意识隐式心跳评估间隔（分钟，默认60分钟跳一次）",
+    "type": "int",
+    "default": 60,
+    "minimum": 10,
+    "maximum": 180
+  },
+  "max_daily_proactive": {
+    "description": "单日最大主动发言次数上限（填 0 为不限次数）",
+    "type": "int",
+    "default": 0,
+    "minimum": 0,
+    "maximum": 50
+  },
+  "min_interval_hours": {
+    "description": "两次主动发言之间的最小冷却时间（小时，可配置）",
+    "type": "float",
+    "default": 2.0,
+    "minimum": 0.5,
+    "maximum": 12.0
+  },
+  "min_silence_hours": {
+    "description": "目标用户多久未发言后才允许评估主动消息（小时）",
+    "type": "float",
+    "default": 1.5,
+    "minimum": 0.2,
+    "maximum": 24.0
+  },
+  "max_unanswered_pings": {
+    "description": "目标用户未回复时最多连续主动发送的消息数（默认 3 次）",
+    "type": "int",
+    "default": 3,
+    "minimum": 1,
+    "maximum": 10
+  },
+  "persona_prompt": {
+    "description": "主动消息的表达风格（可选；请在本地配置，避免将个人信息提交到仓库）",
+    "type": "text",
+    "default": ""
+  }
+}

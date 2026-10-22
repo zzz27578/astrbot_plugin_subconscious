@@ -1,0 +1,8 @@
+name: astrbot_plugin_subconscious
+display_name: 潜意识主动消息
+desc: 基于定时心跳与单次无状态 LLM 评估的主动私聊插件，支持沉默判断、冷却和未回复次数限制。
+short_desc: 潜意识沙盒主动消息插件
+version: v0.1.3
+author: zzz27578
+repo: "https://github.com/zzz27578/astrbot_plugin_subconscious"
+astrbot_version: ">=4.16,<5"
