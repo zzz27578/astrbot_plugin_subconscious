@@ -257,7 +257,15 @@ class Context:
 
 class Event:
     def __init__(
-        self, message="潜意识测试 3", sender="101", umo=UMO, admin=False, private=True
+        self,
+        message="潜意识测试 3",
+        sender="101",
+        umo=UMO,
+        admin=False,
+        private=True,
+        components=None,
+        raw=None,
+        self_id="bot-account",
     ):
         self.message_str = message
         self.sender = sender
@@ -265,12 +273,20 @@ class Event:
         self.admin = admin
         self.private = private
         self.stopped = False
+        self.message_obj = types.SimpleNamespace(
+            self_id=self_id,
+            raw_message=raw if raw is not None else {"post_type": "message"},
+            message=components if components is not None else [],
+        )
 
     def get_sender_id(self):
         return self.sender
 
     def is_private_chat(self):
         return self.private
+
+    def get_messages(self):
+        return self.message_obj.message
 
     def is_admin(self):
         return self.admin
@@ -324,6 +340,10 @@ class ParsingTests(unittest.TestCase):
             ("潜意识测试", (False, False, None)),
             ("/潜意识测试 3", (False, False, 3)),
             ("潜意识测试 force 30m 发送", (True, True, 0.5)),
+            ("潜意识测试 强制", (True, True, None)),
+            ("潜意识测试 force 3", (True, True, 3)),
+            ("潜意识测试 force 3 预览", (True, False, 3)),
+            ("潜意识测试 预览 force 3", (True, False, 3)),
             ("潜意识测试 3小时 强制 预览", (True, False, 3)),
         ]:
             self.assertEqual(plugin._parse_test_args(message), expected)
@@ -469,6 +489,109 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("SENT", responses[-1])
         self.assertIn("强制构思", self.context.calls[0]["prompt"])
         self.assertEqual(len(self.context.sent), 1)
+
+    async def test_notice_events_during_force_test_do_not_prevent_send(self):
+        async def notices():
+            for post_type in ("notice", "notice", "request", "message_sent"):
+                event = Event("", raw={"post_type": post_type, "notice_type": "notify"})
+                await self.bot.on_user_message(event)
+                await self.bot.on_assistant_message_sent(event)
+
+        self.context.hook = notices
+        responses = await self.command(
+            self.bot.cmd_test_subconscious, Event("潜意识测试 强制")
+        )
+        self.assertIn("SENT", responses[-1])
+        self.assertNotIn("STALE", responses[-1])
+        self.assertEqual(len(self.context.sent), 1)
+        self.assertEqual(self.bot._unanswered_ping_count, 1)
+
+    async def test_blank_messages_during_numeric_preview_do_not_discard_result(self):
+        async def blanks():
+            for text in ("", " ", "\t\n", "\xa0"):
+                await self.bot.on_user_message(Event(text))
+
+        self.context.hook = blanks
+        responses = await self.command(
+            self.bot.cmd_test_subconscious, Event("潜意识测试 3")
+        )
+        self.assertIn("APPROVED", responses[-1])
+        self.assertFalse(self.context.sent)
+
+    async def test_force_with_explicit_preview_does_not_send_or_save_draft(self):
+        responses = await self.command(
+            self.bot.cmd_test_subconscious, Event("潜意识测试 force 3 预览")
+        )
+        self.assertIn("APPROVED", responses[-1])
+        self.assertFalse(self.context.sent)
+        self.assertFalse(self.context.conversation_manager.updated)
+
+    async def test_empty_events_do_not_change_activity_silence_or_unanswered_count(
+        self,
+    ):
+        before = self.bot._activity_revision, self.bot._last_activity_time
+        self.bot._unanswered_ping_count = 2
+        events = [
+            Event(""),
+            Event(" \n"),
+            Event("", raw={"post_type": "notice"}),
+            Event("transport text", raw={"post_type": "notice"}),
+            Event("outgoing echo", self_id="101"),
+            Event("", components=[types.SimpleNamespace(type="Plain", text=" ")]),
+            Event(
+                "",
+                components=[
+                    types.SimpleNamespace(type="At"),
+                    types.SimpleNamespace(type="Reply"),
+                ],
+            ),
+        ]
+        for event in events:
+            await self.bot.on_user_message(event)
+            await self.bot.on_assistant_message_sent(event)
+        self.assertEqual(
+            (self.bot._activity_revision, self.bot._last_activity_time), before
+        )
+        self.assertEqual(self.bot._unanswered_ping_count, 2)
+
+    async def test_real_media_without_text_still_discards_candidate(self):
+        for kind in ("Image", "Record", "Video", "File", "Face"):
+            with self.subTest(kind=kind):
+
+                async def incoming_media(kind=kind):
+                    await self.bot.on_user_message(
+                        Event(
+                            "",
+                            components=[
+                                types.SimpleNamespace(
+                                    type=types.SimpleNamespace(value=kind)
+                                )
+                            ],
+                        )
+                    )
+
+                self.context.hook = incoming_media
+                result = await self.bot._tick(bypass_rules=True, force_speak=True)
+                self.assertEqual(result.status, "STALE")
+        self.assertFalse(self.context.sent)
+
+    async def test_genuine_text_in_message_chain_counts_as_activity(self):
+        before = self.bot._activity_revision
+        await self.bot.on_user_message(
+            Event("", components=[types.SimpleNamespace(type="Plain", text="hello")])
+        )
+        self.assertGreater(self.bot._activity_revision, before)
+
+    async def test_status_control_during_evaluation_does_not_discard_candidate(self):
+        async def status():
+            event = Event("潜意识状态")
+            await self.bot.on_user_message(event)
+            await self.bot.on_assistant_message_sent(event)
+
+        self.context.hook = status
+        self.assertEqual(
+            (await self.bot._tick(bypass_rules=True, deliver=False)).status, "APPROVED"
+        )
 
     async def test_invalid_model_output_and_exception_are_errors(self):
         self.context.response_text = "raw private thought"
@@ -697,11 +820,13 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_control_commands_do_not_reset_silence_or_unanswered_count(self):
         before = self.bot._last_activity_time
+        revision = self.bot._activity_revision
         self.bot._unanswered_ping_count = 2
         await self.bot.on_user_message(Event("潜意识测试 3"))
         await self.bot.on_assistant_message_sent(Event("潜意识测试 3"))
         self.assertEqual(self.bot._last_activity_time, before)
         self.assertEqual(self.bot._unanswered_ping_count, 2)
+        self.assertEqual(self.bot._activity_revision, revision)
         await self.bot.on_user_message(Event("正常回复"))
         self.assertGreater(self.bot._last_activity_time, before)
         self.assertEqual(self.bot._unanswered_ping_count, 0)

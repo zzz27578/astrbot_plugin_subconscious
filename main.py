@@ -20,6 +20,24 @@ BINDING_KEY = "active_binding"
 CONTROL_COMMANDS = {"潜意识绑定", "潜意识解绑", "潜意识状态", "潜意识测试"}
 MAX_MESSAGE_LENGTH = 300
 MAX_CONTEXT_CHARACTERS = 24000
+CONTENT_COMPONENT_TYPES = {
+    "Image",
+    "Record",
+    "Video",
+    "File",
+    "Face",
+    "Forward",
+    "Node",
+    "Nodes",
+    "RPS",
+    "Dice",
+    "Shake",
+    "Share",
+    "Contact",
+    "Location",
+    "Music",
+    "Json",
+}
 
 
 @dataclass(frozen=True)
@@ -38,6 +56,33 @@ class TickResult:
 
 def _get_cst_now() -> datetime.datetime:
     return datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8)))
+
+
+def _is_real_user_message(event: AstrMessageEvent) -> bool:
+    """Ignore transport notices and echoes while preserving real media messages."""
+    message_obj = getattr(event, "message_obj", None)
+    self_id = getattr(message_obj, "self_id", None)
+    if self_id and str(event.get_sender_id()) == str(self_id):
+        return False
+    raw_message = getattr(message_obj, "raw_message", None)
+    raw_get = getattr(raw_message, "get", None)
+    post_type = raw_get("post_type") if callable(raw_get) else None
+    if post_type and post_type != "message":
+        return False
+    text = (event.message_str or "").strip()
+    command = text.lstrip("/").split()
+    if command and command[0] in CONTROL_COMMANDS:
+        return False
+    if text:
+        return True
+    for component in event.get_messages():
+        kind = getattr(component, "type", None)
+        kind = getattr(kind, "value", kind)
+        if kind in CONTENT_COMPONENT_TYPES:
+            return True
+        if kind == "Plain" and (getattr(component, "text", "") or "").strip():
+            return True
+    return False
 
 
 def _read_history(conversation) -> list[dict]:
@@ -130,6 +175,8 @@ def _parse_test_args(message: str) -> tuple[bool, bool, float | None]:
                 raise ValueError("Invalid simulated duration")
         else:
             raise ValueError("Unexpected test argument")
+    if force_speak and not delivery_seen:
+        deliver = True
     return force_speak, deliver, mock_hours
 
 
@@ -137,7 +184,7 @@ def _parse_test_args(message: str) -> tuple[bool, bool, float | None]:
     "astrbot_plugin_subconscious",
     "zzz27578",
     "绑定私聊后，由主模型在临时沙盒中决策的主动消息插件",
-    "0.2.0",
+    "0.2.1",
 )
 class SubconsciousPlugin(Star):
     def __init__(self, context: Context, config: dict | None = None):
@@ -286,21 +333,20 @@ class SubconsciousPlugin(Star):
             not binding
             or str(event.unified_msg_origin) != binding.umo
             or str(event.get_sender_id()) != binding.user_id
+            or not _is_real_user_message(event)
         ):
             return
         self._activity_revision += 1
-        command = (event.message_str or "").strip().lstrip("/").split()
-        if command and command[0] in CONTROL_COMMANDS:
-            return
         self._last_activity_time = time.time()
         self._unanswered_ping_count = 0
 
     @filter.after_message_sent()
     async def on_assistant_message_sent(self, event: AstrMessageEvent):
-        if not self._binding or str(event.unified_msg_origin) != self._binding.umo:
-            return
-        command = (event.message_str or "").strip().lstrip("/").split()
-        if command and command[0] in CONTROL_COMMANDS:
+        if (
+            not self._binding
+            or str(event.unified_msg_origin) != self._binding.umo
+            or not _is_real_user_message(event)
+        ):
             return
         self._last_activity_time = time.time()
         self._activity_revision += 1
@@ -321,7 +367,8 @@ class SubconsciousPlugin(Star):
             yield event.plain_result(
                 "用法：/潜意识测试 [评估|force] [静默时长] [预览|发送]\n"
                 "例如：/潜意识测试 3、/潜意识测试 3 发送、"
-                "/潜意识测试 force 3 发送；时长默认小时，也支持 30m"
+                "/潜意识测试 强制、/潜意识测试 force 3 预览；"
+                "强制模式默认发送，普通评估默认预览；时长默认小时，也支持 30m"
             )
             event.stop_event()
             return
@@ -501,7 +548,9 @@ message 只包含真正的对话内容，1–3 句，最多 {MAX_MESSAGE_LENGTH}
                 )
             if self._binding is not binding or self._activity_revision != revision:
                 return TickResult(
-                    "STALE", "评估期间对话有新活动或绑定已变化，已丢弃结果", provider_id
+                    "STALE",
+                    "评估期间收到新的真实对话消息或绑定已变化，已丢弃结果",
+                    provider_id,
                 )
             if action == "skip":
                 return TickResult(
