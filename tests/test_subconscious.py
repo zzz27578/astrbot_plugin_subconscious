@@ -13,7 +13,7 @@ import unittest
 import weakref
 from contextlib import asynccontextmanager
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 
 class MessageType(enum.Enum):
@@ -730,6 +730,88 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("绑定状态：生效（整个私聊会话）", responses[-1])
             self.assertIn(UMO, responses[-1])
             self.assertNotIn("重新绑定", responses[-1])
+
+    async def test_status_after_forward_reports_precise_silence_without_resetting_it(
+        self,
+    ):
+        last_reply = datetime.datetime(2026, 10, 23, 13, 10, 49, 430000, plugin.CST)
+        forwarded_at = last_reply.replace(
+            hour=15, minute=32, second=50, microsecond=479000
+        )
+        queried_at = last_reply.replace(
+            hour=15, minute=34, second=21, microsecond=422000
+        )
+        with patch.object(plugin.time, "time", return_value=last_reply.timestamp()):
+            await self.bot.on_assistant_message_sent(Event("还剩二十分钟"))
+        with patch.object(plugin.time, "time", return_value=forwarded_at.timestamp()):
+            await self.bot.on_user_message(
+                Event("[转发消息]", components=[types.SimpleNamespace(type="Forward")])
+            )
+        before = self.bot._last_activity_time, self.bot._activity_revision
+        with patch.object(plugin.time, "time", return_value=queried_at.timestamp()):
+            event = Event("潜意识状态")
+            await self.bot.on_user_message(event)
+            responses = await self.command(self.bot.cmd_status, event)
+            await self.bot.on_assistant_message_sent(event)
+        self.assertIn("静默时长：0 小时 1 分 30 秒", responses[-1])
+        self.assertIn("最近计时更新：2026-10-23 15:32:50（北京时间）", responses[-1])
+        self.assertIn("更新原因：用户消息", responses[-1])
+        self.assertEqual(
+            (self.bot._last_activity_time, self.bot._activity_revision), before
+        )
+        self.assertFalse(self.context.calls)
+
+    async def test_status_without_forward_retains_two_hours_despite_blank_and_control(
+        self,
+    ):
+        last_reply = datetime.datetime(2026, 10, 23, 13, 10, 49, 430000, plugin.CST)
+        queried_at = last_reply.replace(
+            hour=15, minute=34, second=21, microsecond=422000
+        )
+        with patch.object(plugin.time, "time", return_value=last_reply.timestamp()):
+            await self.bot.on_assistant_message_sent(Event("还剩二十分钟"))
+        self.bot._unanswered_ping_count = 2
+        with patch.object(plugin.time, "time", return_value=queried_at.timestamp()):
+            await self.bot.on_user_message(Event(" \n"))
+            event = Event("/潜意识状态")
+            await self.bot.on_user_message(event)
+            responses = await self.command(self.bot.cmd_status, event)
+            await self.bot.on_assistant_message_sent(event)
+        self.assertIn("静默时长：2 小时 23 分 31 秒", responses[-1])
+        self.assertIn("最近计时更新：2026-10-23 13:10:49（北京时间）", responses[-1])
+        self.assertIn("更新原因：助手回复", responses[-1])
+        self.assertEqual(self.bot._unanswered_ping_count, 2)
+
+    async def test_heartbeat_logs_actual_rule_reason_and_elapsed_silence(self):
+        now = DAY.timestamp()
+        self.bot._last_activity_time = now - 90
+        with (
+            patch.object(plugin.time, "time", return_value=now),
+            patch.object(
+                plugin.asyncio,
+                "sleep",
+                new=AsyncMock(side_effect=[None, asyncio.CancelledError()]),
+            ),
+            patch.object(plugin.logger, "info") as log_info,
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await self.bot._subconscious_loop()
+        log_info.assert_called_once_with(
+            "[Subconscious] Heartbeat result: %s; %s",
+            "RULE_SKIP",
+            "对话尚未达到最小静默时长"
+            "（当前 0 小时 1 分 30 秒 / 要求 1 小时 30 分 0 秒），未调用模型",
+        )
+        self.assertFalse(self.context.calls)
+
+    async def test_cooldown_reason_reports_remaining_time_without_calling_model(self):
+        now = DAY.timestamp()
+        self.bot._last_proactive_timestamp = now - 10
+        with patch.object(plugin.time, "time", return_value=now):
+            result = await self.bot._tick()
+        self.assertEqual(result.status, "RULE_SKIP")
+        self.assertIn("冷却期（剩余 1 小时 59 分 50 秒）", result.detail)
+        self.assertFalse(self.context.calls)
 
     async def test_switch_while_acquiring_send_lock_discards_only_current_attempt(self):
         manager = self.context.conversation_manager

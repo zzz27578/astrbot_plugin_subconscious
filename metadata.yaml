@@ -2,7 +2,7 @@ name: astrbot_plugin_subconscious
 display_name: 潜意识主动消息
 desc: 绑定整个私聊会话，自动跟随当前对话的主模型、人设和历史，在临时沙盒中判断是否主动接话，批准后才发送。
 short_desc: 潜意识沙盒主动消息插件
-version: v0.2.2
+version: v0.2.3
 author: zzz27578
 repo: "https://github.com/zzz27578/astrbot_plugin_subconscious"
 astrbot_version: ">=4.29.1,<5"

@@ -17,6 +17,7 @@ from astrbot.core.platform.message_type import MessageType
 from astrbot.core.utils.session_lock import session_lock_manager
 
 BINDING_KEY = "active_binding"
+CST = datetime.timezone(datetime.timedelta(hours=8))
 CONTROL_COMMANDS = {"潜意识绑定", "潜意识解绑", "潜意识状态", "潜意识测试"}
 MAX_MESSAGE_LENGTH = 300
 MAX_CONTEXT_CHARACTERS = 24000
@@ -54,7 +55,13 @@ class TickResult:
 
 
 def _get_cst_now() -> datetime.datetime:
-    return datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8)))
+    return datetime.datetime.now(CST)
+
+
+def _format_duration(seconds: float) -> str:
+    hours, remainder = divmod(max(0, int(seconds)), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours} 小时 {minutes} 分 {seconds} 秒"
 
 
 def _is_real_user_message(event: AstrMessageEvent) -> bool:
@@ -183,7 +190,7 @@ def _parse_test_args(message: str) -> tuple[bool, bool, float | None]:
     "astrbot_plugin_subconscious",
     "zzz27578",
     "绑定私聊后，由主模型在临时沙盒中决策的主动消息插件",
-    "0.2.2",
+    "0.2.3",
 )
 class SubconsciousPlugin(Star):
     def __init__(self, context: Context, config: dict | None = None):
@@ -195,6 +202,7 @@ class SubconsciousPlugin(Star):
         self._binding_lock = asyncio.Lock()
         self._activity_revision = 0
         self._last_activity_time = time.time()
+        self._last_activity_reason = "插件加载（重新开始计时）"
         self._last_trigger_date = ""
         self._today_proactive_count = 0
         self._last_proactive_timestamp = 0.0
@@ -285,6 +293,7 @@ class SubconsciousPlugin(Star):
             self._binding = binding
             self._activity_revision += 1
             self._last_activity_time = time.time()
+            self._last_activity_reason = "绑定或重新绑定"
             self._unanswered_ping_count = 0
         yield event.plain_result(
             f"已绑定当前私聊会话：{binding.umo}\n"
@@ -332,10 +341,13 @@ class SubconsciousPlugin(Star):
             event.stop_event()
             return
         dialogue_state = "自动跟随当前对话" if cid else "暂无当前对话，等待正常聊天创建"
-        silence = max(0.0, (time.time() - self._last_activity_time) / 3600)
+        silence = _format_duration(time.time() - self._last_activity_time)
+        last_activity = datetime.datetime.fromtimestamp(self._last_activity_time, CST)
         yield event.plain_result(
             f"绑定状态：生效（整个私聊会话）\n私聊会话：{binding.umo}\n"
-            f"上下文：{dialogue_state}\n静默时长：{silence:.1f} 小时\n"
+            f"上下文：{dialogue_state}\n静默时长：{silence}\n"
+            f"最近计时更新：{last_activity:%Y-%m-%d %H:%M:%S}（北京时间）\n"
+            f"更新原因：{self._last_activity_reason}\n"
             f"连续未回复：{self._unanswered_ping_count}\n"
             f"节拍：约 {self.config.get('tick_interval_minutes', 60)} 分钟"
         )
@@ -353,6 +365,7 @@ class SubconsciousPlugin(Star):
             return
         self._activity_revision += 1
         self._last_activity_time = time.time()
+        self._last_activity_reason = "用户消息（包括文字、转发和媒体）"
         self._unanswered_ping_count = 0
 
     @filter.after_message_sent()
@@ -364,6 +377,7 @@ class SubconsciousPlugin(Star):
         ):
             return
         self._last_activity_time = time.time()
+        self._last_activity_reason = "助手回复"
         self._activity_revision += 1
 
     @filter.command("潜意识测试")
@@ -407,7 +421,11 @@ class SubconsciousPlugin(Star):
         while True:
             try:
                 result = await self._tick()
-                logger.info("[Subconscious] Heartbeat result: %s", result.status)
+                logger.info(
+                    "[Subconscious] Heartbeat result: %s; %s",
+                    result.status,
+                    result.detail,
+                )
             except Exception as exc:
                 logger.error("[Subconscious] Heartbeat failed (%s)", type(exc).__name__)
             minutes = float(self.config.get("tick_interval_minutes", 60))
@@ -425,20 +443,26 @@ class SubconsciousPlugin(Star):
         daily_limit = int(self.config.get("max_daily_proactive", 0))
         if daily_limit > 0 and count >= daily_limit:
             return "已达到今日主动消息上限，未调用模型"
-        if (
-            now_ts - self._last_proactive_timestamp
-            < float(self.config.get("min_interval_hours", 2.0)) * 3600
-        ):
-            return "仍处于主动消息冷却期，未调用模型"
+        cooldown_remaining = float(
+            self.config.get("min_interval_hours", 2.0)
+        ) * 3600 - (now_ts - self._last_proactive_timestamp)
+        if cooldown_remaining > 0:
+            return (
+                "仍处于主动消息冷却期"
+                f"（剩余 {_format_duration(math.ceil(cooldown_remaining))}），未调用模型"
+            )
         if self._unanswered_ping_count >= int(
             self.config.get("max_unanswered_pings", 3)
         ):
             return "连续未回复次数已达上限，等待用户回复，未调用模型"
-        if (
-            now_ts - self._last_activity_time
-            < float(self.config.get("min_silence_hours", 1.5)) * 3600
-        ):
-            return "对话尚未达到最小静默时长，未调用模型"
+        silence = max(0.0, now_ts - self._last_activity_time)
+        required_silence = float(self.config.get("min_silence_hours", 1.5)) * 3600
+        if silence < required_silence:
+            return (
+                "对话尚未达到最小静默时长"
+                f"（当前 {_format_duration(silence)} / 要求 {_format_duration(required_silence)}），"
+                "未调用模型"
+            )
         return None
 
     async def _evaluate(
@@ -621,6 +645,7 @@ message 只包含真正的对话内容，1–3 句，最多 {MAX_MESSAGE_LENGTH}
                 self._today_proactive_count += 1
                 self._last_proactive_timestamp = time.time()
                 self._last_activity_time = self._last_proactive_timestamp
+                self._last_activity_reason = "主动消息发送成功"
                 if self._activity_revision == revision:
                     self._unanswered_ping_count += 1
                 self._activity_revision += 1
