@@ -119,29 +119,44 @@ DAY = datetime.datetime(
 class Manager:
     def __init__(self):
         self.current_id = "conversation-1"
-        self.history = [
-            {"role": "user", "content": "先去忙了，拜拜"},
-            {"role": "assistant", "content": "好，晚点聊"},
-        ]
+        self.conversations = {
+            "conversation-1": {
+                "history": [
+                    {"role": "user", "content": "先去忙了，拜拜"},
+                    {"role": "assistant", "content": "好，晚点聊"},
+                ],
+                "persona_id": "selected-persona",
+            }
+        }
         self.missing = False
         self.update_error = False
         self.updated = []
         self.created = []
 
+    @property
+    def history(self):
+        return self.conversations[self.current_id]["history"]
+
+    @history.setter
+    def history(self, history):
+        self.conversations[self.current_id]["history"] = history
+
     async def get_curr_conversation_id(self, unified_msg_origin):
         return self.current_id
 
     async def get_conversation(self, unified_msg_origin, conversation_id):
-        if self.missing:
+        if self.missing or conversation_id not in self.conversations:
             return None
+        conversation = self.conversations[conversation_id]
         return types.SimpleNamespace(
-            history=json.dumps(self.history), persona_id="selected-persona"
+            history=json.dumps(conversation["history"]),
+            persona_id=conversation["persona_id"],
         )
 
     async def new_conversation(self, unified_msg_origin):
         self.created.append(unified_msg_origin)
         self.current_id = "new-conversation"
-        self.history = []
+        self.conversations[self.current_id] = {"history": [], "persona_id": None}
         return self.current_id
 
     async def update_conversation(
@@ -158,7 +173,7 @@ class Manager:
         self.updated.append(
             (unified_msg_origin, conversation_id, copy.deepcopy(history))
         )
-        self.history = copy.deepcopy(history)
+        self.conversations[conversation_id]["history"] = copy.deepcopy(history)
 
 
 class Response:
@@ -386,7 +401,7 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.context = Context()
         self.bot = plugin.SubconsciousPlugin(self.context, {"target_user_id": "101"})
-        self.bot._binding = plugin.Binding(UMO, "101", "conversation-1")
+        self.bot._binding = plugin.Binding(UMO, "101")
         self.bot._last_activity_time = time.time() - 10800
         self.clock = patch.object(plugin, "_get_cst_now", return_value=DAY)
         self.clock.start()
@@ -639,17 +654,133 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.bot._tick(bypass_rules=True)).status, "STALE")
         self.assertFalse(self.context.sent)
 
-    async def test_switch_and_delete_do_not_call_model(self):
-        self.context.conversation_manager.current_id = "different-conversation"
+    async def test_missing_dialogue_keeps_private_session_binding(self):
+        binding = self.bot._binding
+        self.context.conversation_manager.current_id = None
         self.assertEqual(
-            (await self.bot._tick(bypass_rules=True)).status, "CONVERSATION_CHANGED"
+            (await self.bot._tick(bypass_rules=True)).status, "WAITING_CONVERSATION"
         )
+        self.assertIs(self.bot._binding, binding)
         self.context.conversation_manager.current_id = "conversation-1"
         self.context.conversation_manager.missing = True
         self.assertEqual(
             (await self.bot._tick(bypass_rules=True)).status, "CONVERSATION_MISSING"
         )
         self.assertFalse(self.context.calls)
+        self.assertIs(self.bot._binding, binding)
+        self.context.conversation_manager.missing = False
+        self.assertEqual(
+            (await self.bot._tick(bypass_rules=True, deliver=False)).status, "APPROVED"
+        )
+
+    async def test_switch_before_tick_uses_current_history_and_persona(self):
+        manager = self.context.conversation_manager
+        old_history = copy.deepcopy(manager.history)
+        new_history = [{"role": "user", "content": "这是新对话里的话题"}]
+        manager.conversations["conversation-2"] = {
+            "history": new_history,
+            "persona_id": "new-persona",
+        }
+        manager.current_id = "conversation-2"
+        binding = self.bot._binding
+        result = await self.bot._tick(bypass_rules=True)
+        self.assertEqual(result.status, "SENT")
+        self.assertIs(self.bot._binding, binding)
+        self.assertEqual(self.context.calls[0]["contexts"][1:], new_history)
+        self.assertEqual(
+            self.context.persona_calls[0], (UMO, "new-persona", "aiocqhttp")
+        )
+        self.assertEqual(manager.updated[0][1], "conversation-2")
+        self.assertEqual(
+            manager.conversations["conversation-1"]["history"], old_history
+        )
+        self.assertEqual(self.context.sent[0][0], UMO)
+
+    async def test_switch_during_evaluation_discards_only_current_attempt_then_follows_new_dialogue(
+        self,
+    ):
+        manager = self.context.conversation_manager
+        manager.conversations["conversation-2"] = {
+            "history": [],
+            "persona_id": "new-persona",
+        }
+        binding = self.bot._binding
+
+        async def switch_dialogue():
+            manager.current_id = "conversation-2"
+
+        self.context.hook = switch_dialogue
+        for deliver in (False, True):
+            manager.current_id = "conversation-1"
+            result = await self.bot._tick(bypass_rules=True, deliver=deliver)
+            self.assertEqual(result.status, "STALE")
+            self.assertIs(self.bot._binding, binding)
+            self.assertFalse(self.context.sent)
+        self.context.hook = None
+        self.assertEqual((await self.bot._tick(bypass_rules=True)).status, "SENT")
+        self.assertEqual(manager.updated[0][1], "conversation-2")
+
+    async def test_status_remains_active_after_switch_and_without_selected_dialogue(
+        self,
+    ):
+        manager = self.context.conversation_manager
+        for cid in ("different-conversation", None):
+            manager.current_id = cid
+            responses = await self.command(self.bot.cmd_status, Event("潜意识状态"))
+            self.assertIn("绑定状态：生效（整个私聊会话）", responses[-1])
+            self.assertIn(UMO, responses[-1])
+            self.assertNotIn("重新绑定", responses[-1])
+
+    async def test_switch_while_acquiring_send_lock_discards_only_current_attempt(self):
+        manager = self.context.conversation_manager
+        manager.conversations["conversation-2"] = {
+            "history": [],
+            "persona_id": "new-persona",
+        }
+        binding = self.bot._binding
+
+        class SwitchingLock:
+            @asynccontextmanager
+            async def acquire_lock(self, session_id):
+                manager.current_id = "conversation-2"
+                yield
+
+        with patch.object(plugin, "session_lock_manager", SwitchingLock()):
+            result = await self.bot._tick(bypass_rules=True)
+        self.assertEqual(result.status, "STALE")
+        self.assertIs(self.bot._binding, binding)
+        self.assertFalse(self.context.sent)
+        self.assertFalse(manager.updated)
+        self.assertEqual((await self.bot._tick(bypass_rules=True)).status, "SENT")
+        self.assertEqual(manager.updated[0][1], "conversation-2")
+
+    async def test_switch_during_delivery_writes_only_to_evaluated_dialogue(self):
+        manager = self.context.conversation_manager
+        old_history = copy.deepcopy(manager.history)
+        new_history = [{"role": "user", "content": "新对话的话题"}]
+        manager.conversations["conversation-2"] = {
+            "history": copy.deepcopy(new_history),
+            "persona_id": "new-persona",
+        }
+
+        async def switch_dialogue():
+            manager.current_id = "conversation-2"
+
+        self.context.send_hook = switch_dialogue
+        result = await self.bot._tick(bypass_rules=True)
+        self.assertEqual(result.status, "SENT")
+        self.assertEqual(self.context.sent[0][0], UMO)
+        self.assertEqual(manager.updated[0][1], "conversation-1")
+        self.assertEqual(
+            manager.conversations["conversation-1"]["history"],
+            old_history + [{"role": "assistant", "content": self.context.sent[0][1]}],
+        )
+        self.assertEqual(
+            manager.conversations["conversation-2"]["history"], new_history
+        )
+        self.context.send_hook = None
+        self.assertEqual((await self.bot._tick(bypass_rules=True)).status, "SENT")
+        self.assertEqual(manager.updated[-1][1], "conversation-2")
 
     async def test_binding_change_discards_candidate(self):
         async def unbind():
@@ -767,7 +898,6 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
                 plugin.BINDING_KEY: {
                     "umo": UMO,
                     "user_id": "101",
-                    "conversation_id": "conversation-1",
                 }
             },
         )
@@ -779,14 +909,55 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.bot._binding)
         self.assertFalse(self.context.kv)
 
-    async def test_bind_can_initialize_an_empty_normal_conversation(self):
+    async def test_bind_does_not_create_or_pin_a_normal_dialogue(self):
         self.context.conversation_manager.current_id = None
         await self.command(self.bot.cmd_bind, Event("潜意识绑定"))
-        self.assertEqual(self.bot._binding.conversation_id, "new-conversation")
-        self.assertEqual(self.context.conversation_manager.created, [UMO])
+        self.assertEqual(self.bot._binding, plugin.Binding(UMO, "101"))
+        self.assertEqual(self.context.conversation_manager.created, [])
+        self.assertEqual(
+            (await self.bot._tick(bypass_rules=True)).status, "WAITING_CONVERSATION"
+        )
+        self.assertFalse(self.context.calls)
+        await self.context.conversation_manager.new_conversation(UMO)
         self.assertEqual(
             (await self.bot._tick(bypass_rules=True, deliver=False)).status, "APPROVED"
         )
+
+    async def test_legacy_binding_migrates_without_rebind_or_old_dialogue(self):
+        self.context.kv[plugin.BINDING_KEY] = {
+            "umo": UMO,
+            "user_id": "101",
+            "conversation_id": "deleted-old-dialogue",
+        }
+        fresh = plugin.SubconsciousPlugin(self.context)
+        await fresh.initialize()
+        try:
+            self.assertEqual(fresh._binding, plugin.Binding(UMO, "101"))
+            self.assertEqual(
+                self.context.kv[plugin.BINDING_KEY], {"umo": UMO, "user_id": "101"}
+            )
+            self.assertEqual(
+                (await fresh._tick(bypass_rules=True, deliver=False)).status, "APPROVED"
+            )
+        finally:
+            await fresh.terminate()
+
+    async def test_legacy_migration_write_failure_still_uses_session_binding(self):
+        self.context.kv[plugin.BINDING_KEY] = {
+            "umo": UMO,
+            "user_id": "101",
+            "conversation_id": "obsolete-dialogue",
+        }
+        self.context.kv_error = True
+        fresh = plugin.SubconsciousPlugin(self.context)
+        await fresh.initialize()
+        try:
+            self.assertEqual(fresh._binding, plugin.Binding(UMO, "101"))
+            self.assertEqual(
+                (await fresh._tick(bypass_rules=True, deliver=False)).status, "APPROVED"
+            )
+        finally:
+            await fresh.terminate()
 
     async def test_invalid_saved_binding_is_not_used(self):
         self.context.kv[plugin.BINDING_KEY] = {

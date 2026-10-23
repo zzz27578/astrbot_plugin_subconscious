@@ -44,7 +44,6 @@ CONTENT_COMPONENT_TYPES = {
 class Binding:
     umo: str
     user_id: str
-    conversation_id: str
 
 
 @dataclass(frozen=True)
@@ -184,7 +183,7 @@ def _parse_test_args(message: str) -> tuple[bool, bool, float | None]:
     "astrbot_plugin_subconscious",
     "zzz27578",
     "绑定私聊后，由主模型在临时沙盒中决策的主动消息插件",
-    "0.2.1",
+    "0.2.2",
 )
 class SubconsciousPlugin(Star):
     def __init__(self, context: Context, config: dict | None = None):
@@ -206,7 +205,11 @@ class SubconsciousPlugin(Star):
         stored = await self.get_kv_data(BINDING_KEY, None)
         if stored is not None:
             try:
-                binding = Binding(**stored)
+                if not isinstance(stored, dict):
+                    raise TypeError("Invalid binding data")
+                routing = dict(stored)
+                routing.pop("conversation_id", None)
+                binding = Binding(**routing)
                 session = MessageSession.from_str(binding.umo)
                 if (
                     session.message_type != MessageType.FRIEND_MESSAGE
@@ -219,6 +222,16 @@ class SubconsciousPlugin(Star):
                 ):
                     raise ValueError("Invalid binding")
                 self._binding = binding
+                if routing != stored:
+                    try:
+                        # Drop the obsolete fixed dialogue ID from older bindings.
+                        await self.put_kv_data(BINDING_KEY, asdict(binding))
+                    except Exception as exc:
+                        logger.warning(
+                            "[Subconscious] Binding migration persistence failed (%s); "
+                            "private session binding remains active in memory",
+                            type(exc).__name__,
+                        )
             except (TypeError, ValueError, AttributeError):
                 logger.warning("[Subconscious] Stored binding is invalid; bind again")
         self._bg_task = asyncio.create_task(self._subconscious_loop())
@@ -253,18 +266,19 @@ class SubconsciousPlugin(Star):
         async with self._binding_lock:
             try:
                 umo = str(event.unified_msg_origin)
-                manager = self.context.conversation_manager
-                cid = await manager.get_curr_conversation_id(umo)
-                if not cid:
-                    cid = await manager.new_conversation(umo)
-                if not isinstance(cid, str) or not cid:
-                    raise ValueError("Conversation ID is unavailable")
-                binding = Binding(umo, str(event.get_sender_id()), cid)
+                session = MessageSession.from_str(umo)
+                if (
+                    session.message_type != MessageType.FRIEND_MESSAGE
+                    or not session.platform_name
+                    or not session.session_id
+                ):
+                    raise ValueError("Invalid private session")
+                binding = Binding(umo, str(event.get_sender_id()))
                 await self.put_kv_data(BINDING_KEY, asdict(binding))
             except Exception as exc:
                 logger.error("[Subconscious] Binding failed (%s)", type(exc).__name__)
                 yield event.plain_result(
-                    "绑定失败：无法读取对话或保存绑定信息，请查看日志"
+                    "绑定失败：无法识别当前私聊或保存绑定信息，请查看日志"
                 )
                 event.stop_event()
                 return
@@ -273,8 +287,8 @@ class SubconsciousPlugin(Star):
             self._last_activity_time = time.time()
             self._unanswered_ping_count = 0
         yield event.plain_result(
-            "已绑定当前私聊和当前对话。对话静默后将按节拍唤醒主模型，"
-            "由模型决定是否主动接话；切换新对话后请重新绑定"
+            f"已绑定当前私聊会话：{binding.umo}\n"
+            "切换或新建对话后仍生效，沙盒会自动读取这条私聊当前的对话、主模型和人设"
         )
         event.stop_event()
 
@@ -317,10 +331,11 @@ class SubconsciousPlugin(Star):
             yield event.plain_result("状态查询失败：无法读取当前对话，请查看日志")
             event.stop_event()
             return
-        state = "生效" if cid == binding.conversation_id else "对话已切换，需重新绑定"
+        dialogue_state = "自动跟随当前对话" if cid else "暂无当前对话，等待正常聊天创建"
         silence = max(0.0, (time.time() - self._last_activity_time) / 3600)
         yield event.plain_result(
-            f"绑定状态：{state}\n静默时长：{silence:.1f} 小时\n"
+            f"绑定状态：生效（整个私聊会话）\n私聊会话：{binding.umo}\n"
+            f"上下文：{dialogue_state}\n静默时长：{silence:.1f} 小时\n"
             f"连续未回复：{self._unanswered_ping_count}\n"
             f"节拍：约 {self.config.get('tick_interval_minutes', 60)} 分钟"
         )
@@ -514,22 +529,23 @@ message 只包含真正的对话内容，1–3 句，最多 {MAX_MESSAGE_LENGTH}
         async with self._evaluation_lock:
             binding = self._binding
             if not binding:
-                return TickResult("UNBOUND", "尚未绑定主动消息对话，未调用模型")
+                return TickResult("UNBOUND", "尚未绑定主动消息私聊会话，未调用模型")
             if not bypass_rules and (reason := self._rule_skip(_get_cst_now())):
                 return TickResult("RULE_SKIP", reason)
             revision = self._activity_revision
             manager = self.context.conversation_manager
             try:
                 cid = await manager.get_curr_conversation_id(binding.umo)
-                if cid != binding.conversation_id:
+                if not cid:
                     return TickResult(
-                        "CONVERSATION_CHANGED",
-                        "当前对话已切换或删除，请重新绑定；未调用模型",
+                        "WAITING_CONVERSATION",
+                        "私聊绑定仍生效，暂无当前对话；正常聊天后将自动跟随，未调用模型",
                     )
                 conversation = await manager.get_conversation(binding.umo, cid)
                 if conversation is None:
                     return TickResult(
-                        "CONVERSATION_MISSING", "绑定对话不存在，请重新绑定；未调用模型"
+                        "CONVERSATION_MISSING",
+                        "私聊绑定仍生效，当前对话暂不可用；等待正常聊天恢复，未调用模型",
                     )
                 history = _read_history(conversation)
                 action, message, provider_id = await asyncio.wait_for(
@@ -538,6 +554,7 @@ message 只包含真正的对话内容，1–3 句，最多 {MAX_MESSAGE_LENGTH}
                     ),
                     timeout=float(self.config.get("llm_timeout_seconds", 120)),
                 )
+                current_cid = await manager.get_curr_conversation_id(binding.umo)
             except asyncio.TimeoutError:
                 return TickResult("LLM_TIMEOUT", "沙盒模型请求超时，未发送任何消息")
             except Exception as exc:
@@ -550,6 +567,12 @@ message 只包含真正的对话内容，1–3 句，最多 {MAX_MESSAGE_LENGTH}
                 return TickResult(
                     "STALE",
                     "评估期间收到新的真实对话消息或绑定已变化，已丢弃结果",
+                    provider_id,
+                )
+            if current_cid != cid:
+                return TickResult(
+                    "STALE",
+                    "评估期间切换了对话，已丢弃当次结果；私聊绑定仍生效，下次自动跟随新对话",
                     provider_id,
                 )
             if action == "skip":
@@ -565,14 +588,12 @@ message 只包含真正的对话内容，1–3 句，最多 {MAX_MESSAGE_LENGTH}
             async with session_lock_manager.acquire_lock(binding.umo):
                 try:
                     # Recheck after acquiring AstrBot's normal conversation lock.
-                    cid = await manager.get_curr_conversation_id(binding.umo)
-                    current = await manager.get_conversation(
-                        binding.umo, binding.conversation_id
-                    )
+                    current_cid = await manager.get_curr_conversation_id(binding.umo)
+                    current = await manager.get_conversation(binding.umo, cid)
                     if (
                         self._binding is not binding
                         or self._activity_revision != revision
-                        or cid != binding.conversation_id
+                        or current_cid != cid
                         or current is None
                         or _read_history(current) != history
                     ):
@@ -605,16 +626,14 @@ message 只包含真正的对话内容，1–3 句，最多 {MAX_MESSAGE_LENGTH}
                 self._activity_revision += 1
                 try:
                     # Only delivered speech becomes part of the normal conversation.
-                    current = await manager.get_conversation(
-                        binding.umo, binding.conversation_id
-                    )
+                    current = await manager.get_conversation(binding.umo, cid)
                     if current is None:
                         raise ValueError("Conversation was deleted during delivery")
                     delivered_history = list(_read_history(current))
                     delivered_history.append({"role": "assistant", "content": message})
                     await manager.update_conversation(
                         unified_msg_origin=binding.umo,
-                        conversation_id=binding.conversation_id,
+                        conversation_id=cid,
                         history=delivered_history,
                     )
                 except Exception as exc:
